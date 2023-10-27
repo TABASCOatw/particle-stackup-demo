@@ -1,69 +1,70 @@
 import React, { useState, useEffect } from 'react';
-import { ethers } from 'ethers';
 import { ParticleNetwork } from '@particle-network/auth';
-import { ParticleProvider } from '@particle-network/provider';
-
-import { createPublicClient, createClient, http } from 'viem';
-import { getAccountNonce, getUserOperationHash, bundlerActions } from 'permissionless';
-import { pimlicoBundlerActions, pimlicoPaymasterActions } from 'permissionless/actions/pimlico';
-
 import { SmartAccount } from '@particle-network/aa';
-
-import { goerli } from 'viem/chains';
+import { ParticleProvider } from '@particle-network/provider';
+import { ethers } from 'ethers';
+import { Presets, Client } from 'userop';
 import { notification } from 'antd';
-
 import './App.css';
+
+const config = {
+  projectId: process.env.REACT_APP_PROJECT_ID,
+  clientKey: process.env.REACT_APP_CLIENT_KEY,
+  appId: process.env.REACT_APP_APP_ID,
+};
+
+const particle = new ParticleNetwork({
+  ...config,
+  chainName: 'ethereum',
+  chainId: 5,
+  wallet: { displayWalletEntry: true },
+});
+
+const provider = new ethers.providers.Web3Provider(new ParticleProvider(particle.auth));
+
+const smartAccountBiconomy = new SmartAccount(new ParticleProvider(particle.auth), {
+  ...config,
+  aaOptions: {
+    simple: [{ chainId: 5, version: '1.0.0' }],
+  },
+});
+
+particle.setERC4337({
+  name: 'SIMPLE',
+  version: '1.0.0'
+})
+
+const initializePaymaster = () => {
+  const paymasterContext = { type: 'payg' };
+  return Presets.Middleware.verifyingPaymaster(
+    process.env.REACT_APP_STACKUP_PAYMASTER,
+    paymasterContext
+  );
+};
 
 const App = () => {
   const [userInfo, setUserInfo] = useState(null);
   const [ethBalance, setEthBalance] = useState(null);
-  const [smartAccount, setSmartAccount] = useState(null);
   const [isDeployed, setIsDeployed] = useState(null);
 
-  const config = {
-    projectId: process.env.REACT_APP_PROJECT_ID,
-    clientKey: process.env.REACT_APP_CLIENT_KEY,
-    appId: process.env.REACT_APP_APP_ID,
-  };
-
-  const particle = new ParticleNetwork({
-    ...config,
-    chainName: 'ethereum',
-    chainId: 5,
-    wallet: { displayWalletEntry: true },
-  });
-
-  const smartAccountBiconomy = new SmartAccount(new ParticleProvider(particle.auth), {
-    ...config,
-    aaOptions: {
-      biconomy: [{ chainId: 5, version: '1.0.0' }],
-    }
-  });
-
-  particle.setERC4337({
-    name: "BICONOMY",
-    version: "1.0.0"
-  });
-
-  const provider = new ethers.providers.Web3Provider(new ParticleProvider(particle.auth));
-
   useEffect(() => {
-    const fetchAccountInfo = async () => {
-      const smartAcc = await smartAccountBiconomy.getAddress();
-      setSmartAccount(smartAcc);
-
-      const balance = ethers.utils.formatEther(await provider.getBalance(smartAcc));
-      setEthBalance(balance);
-
-      setIsDeployed(await smartAccountBiconomy.isDeployed());
-    };
-
     if (userInfo) fetchAccountInfo();
   }, [userInfo]);
 
+  const fetchAccountInfo = async () => {
+    const address = await smartAccountBiconomy.getAddress();
+    const balance = ethers.utils.formatEther(await provider.getBalance(address));
+    const isDeployed = await smartAccountBiconomy.isDeployed();
+
+    setEthBalance(balance);
+    setIsDeployed(isDeployed);
+  };
+
   const deployAccount = async () => {
-    if (!(await smartAccountBiconomy.isDeployed())) await smartAccountBiconomy.deployWalletContract();
-  }
+    if (!isDeployed) {
+      await smartAccountBiconomy.deployWalletContract();
+    }
+  };
 
   const handleLogin = async (preferredAuthType) => {
     const user = await particle.auth.login({ preferredAuthType });
@@ -71,63 +72,30 @@ const App = () => {
   };
 
   const executeUserOp = async () => {
+    const paymaster = initializePaymaster();
     const signer = provider.getSigner();
-    const entryPoint = "0x5FF137D4b0FDCD49DcA30c7CF57E578a026d2789";
+    const builder = await Presets.Builder.SimpleAccount.init(signer, process.env.REACT_APP_RPC_URL, { paymasterMiddleware: paymaster });
+    const client = await Client.init(process.env.REACT_APP_RPC_URL);
 
-    const publicClient = createPublicClient({
-      transport: http(process.env.REACT_APP_RPC_URL),
-      chain: goerli
+    const address = builder.getSender();
+    console.log(`Account address: ${address}`);
+
+    const res = await client.sendUserOperation(builder.execute("0x000000000000000000000000000000000000dEaD", ethers.utils.parseUnits('0.001', 'ether'), "0x"), {
+      onBuild: (op) => console.log("Signed UserOperation:", op),
     });
-
-    const bundlerClient = createClient({
-      transport: http(`https://api.pimlico.io/v1/goerli/rpc?apikey=${process.env.REACT_APP_PIMLICO_KEY}`),
-      chain: goerli
-    }).extend(bundlerActions).extend(pimlicoBundlerActions);
-
-    const paymasterClient = createClient({
-      transport: http(`https://api.pimlico.io/v2/goerli/rpc?apikey=${process.env.REACT_APP_PIMLICO_KEY}`),
-      chain: goerli
-    }).extend(pimlicoPaymasterActions);
-
-    const [nonce, gasPrice] = await Promise.all([
-      getAccountNonce(publicClient, { address: smartAccount, entryPoint }),
-      bundlerClient.getUserOperationGasPrice()
-    ]);
-
-    const account = new ethers.utils.Interface(["function executeCall(address to, uint256 value, bytes data)"]);
-    const callData = account.encodeFunctionData("executeCall", ["0x000000000000000000000000000000000000dEaD", ethers.utils.parseUnits('0.001', 'ether'), "0x"]);
-
-    let userOperation = {
-      sender: smartAccount,
-      nonce,
-      initCode: "0x",
-      callData,
-      maxFeePerGas: gasPrice.fast.maxFeePerGas,
-      maxPriorityFeePerGas: gasPrice.fast.maxPriorityFeePerGas,
-      signature: "0xfffffffffffffffffffffffffffffff0000000000000000000000000000000007aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa1c"
-    };
-
-    const sponsorResult = await paymasterClient.sponsorUserOperation({ userOperation, entryPoint });
-
-    userOperation = { ...userOperation, ...sponsorResult };
-
-    const userOperationHash = getUserOperationHash({ userOperation, chainId: 5, entryPoint });
-
-    userOperation.signature = await signer.signMessage(ethers.utils.arrayify(userOperationHash));
-
-    const userOperationHashResult = await bundlerClient.sendUserOperation({ userOperation, entryPoint });
 
     notification.success({
       message: "User operation successful",
-      description: `Hash: ${userOperationHashResult}`
+      description: `userOpHash: ${res.userOpHash}`
     });
   };
+
 
   return (
       <div className="App">
         <div className="logo-section">
           <img src="https://i.imgur.com/EerK7MS.png" alt="Logo 1" className="logo logo-big"/>
-          <img src="https://i.imgur.com/YbaX0Eb.png" alt="Logo 2" className="logo"/>
+          <img src="https://i.imgur.com/9gGvvtO.png" alt="Logo 2" className="logo"/>
         </div>
         {!userInfo ? (
           <div className="login-section">
@@ -137,7 +105,7 @@ const App = () => {
         ) : (
           <div className="profile-card">
             <h2>{userInfo.name}</h2>
-            <div className="avax-balance-section">
+            <div className="balance-section">
               <small>{ethBalance} ETH</small>
               {isDeployed ? (
                 <button className="sign-message-button" onClick={executeUserOp}>Execute User Operation</button>
